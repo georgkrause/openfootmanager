@@ -1327,6 +1327,15 @@ fn bootstrap_existing_world_takeover(
         ofm_core::job_offers::hire_manager(game, team_id, &takeover_date)?;
     }
 
+    // Align the legacy `game.league` mirror with the user's actual
+    // competition now that `manager.team_id` is set. `promote_legacy_league`
+    // ran at world-import time (before team selection), so it fell back to
+    // `competitions.first()` — often not the user's league. Any transfer
+    // offer written before the first turn-loop `sync_legacy_league` (which
+    // only runs on days that have a scheduled match) would derive its
+    // `registration_date` from the wrong league's season_start.
+    game.sync_legacy_league();
+
     let staff_msg = ofm_core::messages::staff_advice_message(&team_name, team_id, &takeover_date);
     game.messages.push(staff_msg);
     ofm_core::player_events::generate_takeover_contract_review_message(game);
@@ -4007,6 +4016,72 @@ competitions:
             .news
             .iter()
             .any(|article| article.category == NewsCategory::ManagerialChange));
+    }
+
+    #[test]
+    fn bootstrap_team_selection_pins_league_to_user_competition_not_list_first() {
+        // Regression guard: after the user takes over their team,
+        // `game.league` must mirror the competition containing that
+        // team — not `competitions.first()`. `derive_season_context`
+        // reads `game.league.fixtures` to compute the transfer window,
+        // and pending-offer `registration_date` is frozen from that
+        // derivation. Without `sync_legacy_league` after the manager
+        // is hired, `game.league` stayed pinned to whatever
+        // `promote_legacy_league` picked at world-import time (the
+        // fallback branch, because `manager.team_id` was None then).
+        // Every transfer offer written before the first day with a
+        // scheduled match would then have its registration_date
+        // derived from the wrong league's season_start.
+
+        let mut game = make_bootstrap_test_game();
+
+        // Add a foreign team + competition that becomes
+        // competitions[0] — the fallback that sync_legacy_league
+        // uses when no user team is set. The user's team1 belongs
+        // to a DIFFERENT competition further down the list.
+        game.teams.push(domain::team::Team::new(
+            "foreign-team".to_string(),
+            "Foreign FC".to_string(),
+            "FOR".to_string(),
+            "Argentina".to_string(),
+            "Buenos Aires".to_string(),
+            "Foreign Ground".to_string(),
+            30_000,
+        ));
+
+        let foreign_league = League::new(
+            "foreign-league".to_string(),
+            "Foreign Division".to_string(),
+            2031,
+            &["foreign-team".to_string()],
+        );
+        let user_league = League::new(
+            "user-league".to_string(),
+            "User Division".to_string(),
+            2031,
+            &["team1".to_string(), "team2".to_string()],
+        );
+        game.competitions = vec![foreign_league.clone(), user_league];
+
+        // Simulate the post-world-import state: promote_legacy_league
+        // fell back to competitions.first() because manager.team_id
+        // was None when the world was loaded.
+        game.league = Some(foreign_league);
+        assert!(game.manager.team_id.is_none());
+
+        bootstrap_team_selection(
+            &mut game,
+            "team1",
+            StartPhase::MidSeason,
+            domain::stats::StatsState::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            game.league.as_ref().map(|league| league.id.as_str()),
+            Some("user-league"),
+            "game.league must mirror the user's team's competition after takeover"
+        );
     }
 
     #[test]
